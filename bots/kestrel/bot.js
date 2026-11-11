@@ -1,7 +1,7 @@
 // 红隼 Kestrel —— 纯视觉闭环参赛脚本。
 // 对局中的全部输入只有 lab.observe / lab.act / lab.fire 返回的 JPEG；输出只有移动、旋转、瞄准和单发请求。
 // 流程：JPEG 局部解码 -> 像素感知（两车位置与装甲相位、炮管、弹丸、HUD 条）
-//       -> 状态估计（对手位移的经验分布、来弹轨迹、热量）-> 机动 / 装甲相位防御 / 瞄准 / 开火。
+//       -> 状态估计（对手位移的经验分布、来弹轨迹、热量）-> 贴身 -> 机动 / 装甲相位防御 / 瞄准 / 开火。
 // 策略说明、实测数据和已知局限见同目录 README.md。
 
 // ───────────────────────── JPEG 局部解码 ─────────────────────────
@@ -455,9 +455,11 @@ const now = () => performance.now();
 const SLOT = 1000 / 30, FW = 960, FH = 600, AR = 34;
 const BV = 1000, MUZ = 42;            // 弹速（px/s）与出膛点到车心距离
 const ENC = 9;                        // 画面从采样到可被取到的最小延迟（ms，本机实测）
-const LEAD = 22;                      // 从决策到弹丸出膛的典型延迟（ms，本机实测）
+const LEAD = 8;                       // 指令在控制边界生效之后，到弹丸出膛还要多久（ms，本机实测）
+const STEP = 1000 / 60;               // 控制周期
 let vMax = 184, wMax = 8;             // 我方满速（px/s）与满转速（rad/s）：默认功率下的值，运行中按实际位移重新标定
 const DEBUG = false;                  // 置 true 时每 2 秒往本席日志写一行运行统计
+const POLL = true;                    // 在控制边界之间主动取新画面
 const rnd = Math.random;
 const wrap90 = a => { a %= HALF; return a > HALF / 2 ? a - HALF : a < -HALF / 2 ? a + HALF : a; };
 
@@ -469,12 +471,12 @@ const est = {
   shells: [],
 };
 const cmd = { vx: 0, vy: 0, om: 0 };
-let turEst = NaN, turT = 0, aimDir = 0, lastFire = -1e9, lastD = 26;
+let turEst = NaN, turT = 0, aimDir = 0, lastFire = -1e9, lastD = 26, bndT = 0;
 let fireGap = 56, reqN = 0, realN = 0, heat0 = 0, heatT = 0, heatM = 0, heatMT = 0;
 let vSumD = 0, vSumT = 0, vLast = 0, mePrev = null, impureT = 0, lastMX = 0, lastMY = 0;
 const shots = [];
 const wander = { ang: rnd() * TAU, until: 0 };
-const dbg = { frames: 0, fires: 0, loops: 0, lost: 0, spin: 0, risk: 0, decode: 0, pSum: 0, pN: 0, raids: 0 };
+const dbg = { frames: 0, fires: 0, loops: 0, lost: 0, spin: 0, risk: 0, decode: 0, pSum: 0, pN: 0, raids: 0, sh: [], poll: 0, fresh: 0 };
 
 // 功率分配：平移与旋转共享上限。
 function motion(mx, my, spin) {
@@ -520,7 +522,7 @@ function foeKin() {
 
 // 对手位移的经验分布：按预测时域分桶，保存「当时速度坐标系下，T 秒后的实际位移」样本。
 // 不假设匀速或高斯：变向型对手的位移是多峰的，直接用样本找最可能的落点。
-const TB = [0.1, 0.14, 0.18, 0.22, 0.27, 0.32, 0.38, 0.45, 0.53, 0.62, 0.74], NS = 96;
+const TB = [0.06, 0.1, 0.14, 0.18, 0.22, 0.27, 0.32, 0.38, 0.45, 0.53, 0.62, 0.74], NS = 96;
 const samp = TB.map(() => ({ par: new Float32Array(NS), per: new Float32Array(NS), ts: new Float32Array(NS), mv: new Uint8Array(NS), n: 0 }));
 function learn() {
   const h = est.fh, n = h.length, L = h[n - 1];
@@ -637,6 +639,75 @@ function heatNow(t) {
 // ───────────────────────── 瞄准 ─────────────────────────
 // hx：弹道相对实际车心横向偏移 (i-16)*2 时是否命中；hist：对手未来横向位移的经验分布（2px 一格）。
 const hx = new Float32Array(33), hist = new Float32Array(141), hsm = new Float32Array(141);
+
+// 近距离命中表。弹丸从炮口出发，而炮口离车心有 42px：两车靠近后，出膛点可能已经越过对手朝向我方的
+// 装甲板、落在车体里（出膛即被挡），也可能正好压在某块板上（出膛即命中）。远处那套「整条弹道平移」的
+// 算法在这里不成立，所以按「弹道横向偏移 × 装甲相对弹道的相位 × 出膛点在垂足前多远」预先算好结局。
+const TO = 32, TP = 45, S_LO = -14, S_HI = 34, NS0 = S_HI - S_LO + 1, NEAR_D = 150;
+const NEAR = new Uint8Array((2 * TO + 1) * TP * NS0);
+for (let o = -TO; o <= TO; o++) for (let p = 0; p < TP; p++) for (let s = S_LO; s <= S_HI; s++)
+  NEAR[((o + TO) * TP + p) * NS0 + s - S_LO] = shellFate(-s, o, BV, 0, (p + 0.5) * HALF / TP, 0) === 1 ? 1 : 0;
+const phIdx = a => { a %= HALF; if (a < 0) a += HALF; const i = (a * (TP / HALF)) | 0; return (i < TP ? i : TP - 1) * NS0; };
+const pOff = new Float32Array(2 * TO + 1), thOff = new Float32Array(2 * TO + 1), sX = new Float32Array(NS + 8), sY = new Float32Array(NS + 8), sW = new Float32Array(NS + 8);
+const PRI = [[0, 0, 0.4], [1, 0, 0.15], [-1, 0, 0.15], [0, 1, 0.15], [0, -1, 0.15]];
+let lastOff = 99;
+// 以炮塔角为搜索变量：对每个候选方向，按对手位置的经验分布逐个样本查表，取命中概率最高的方向。
+function aimNear(k, mx, my, D, ux, uy, tLag, S, N, sc0, T0, mv, ex, ey) {
+  // 弹丸飞到装甲圈的时间（贴身时为零）。
+  const tof = Math.max(0, D - MUZ - 26) / BV, T = Math.max(0.02, tLag + tof), sc = sc0 * T / T0;
+  let n = 0, ws = 0, mxT = 0, myT = 0;
+  for (let j = 0; j < N; j++) {
+    if (S.mv[j] !== mv) continue;
+    const dt = (S.ts[j] - k.ts) / 90, w = 1 / (1 + dt * dt);
+    sX[n] = k.x + (S.par[j] * ex - S.per[j] * ey) * sc; sY[n] = k.y + (S.par[j] * ey + S.per[j] * ex) * sc; sW[n++] = w; ws += w;
+  }
+  if (ws < 10) {
+    // 样本不足时混入先验：匀速外推为中心，四周各放一个点。
+    const sg = 3 + 22 * T, add = 10 - ws;
+    for (const [a, b, w] of PRI) { sX[n] = k.x + k.vx * T + a * sg; sY[n] = k.y + k.vy * T + b * sg; sW[n++] = add * w; }
+    ws = 10;
+  }
+  for (let i = 0; i < n; i++) {
+    let x = clamp(sX[i], AR, FW - AR), y = clamp(sY[i], AR, FH - AR);
+    // 两车不会重叠：落进我方车体范围的样本沿连线推出去。
+    const ox = x - mx, oy = y - my, od = Math.hypot(ox, oy);
+    if (od < 52 && od > 1e-6) { x = mx + ox / od * 52; y = my + oy / od * 52; }
+    sX[i] = x; sY[i] = y; mxT += x * sW[i]; myT += y * sW[i];
+  }
+  mxT /= ws; myT /= ws;
+  const base = Math.atan2(uy, ux), sig = 0.05 + est.omJit * T, blind = sig > 0.35, phC = k.a + k.om * T;
+  for (let o = -TO; o <= TO; o++) {
+    const th = base + Math.asin(clamp(o / D, -0.95, 0.95)), c = Math.cos(th), s = Math.sin(th);
+    thOff[o + TO] = th;
+    const Mx = mx + MUZ * c, My = my + MUZ * s, i0 = phIdx(phC - th), i1 = phIdx(phC + sig - th), i2 = phIdx(phC - sig - th);
+    let p = 0;
+    for (let i = 0; i < n; i++) {
+      const rx = Mx - sX[i], ry = My - sY[i], off = Math.round(ry * c - rx * s);
+      let s0 = Math.round(-(rx * c + ry * s));
+      if (off < -TO || off > TO || s0 < S_LO) continue;
+      if (s0 > S_HI) s0 = S_HI;
+      const row = (off + TO) * TP * NS0 + s0 - S_LO;
+      if (blind) { let h = 0; for (let q = 0; q < TP; q += 5) h += NEAR[row + q * NS0]; p += sW[i] * h / 9; }
+      else p += sW[i] * (0.5 * NEAR[row + i0] + 0.25 * NEAR[row + i1] + 0.25 * NEAR[row + i2]);
+    }
+    pOff[o + TO] = p / ws;
+  }
+  let best = -1, bo = 0, bp = 0;
+  for (let o = -TO; o <= TO; o++) {
+    // 偏好宽一些的命中窗口：瞄点和时序都有一两个像素的误差。
+    const v = (2 * pOff[o + TO] + (o > -TO ? pOff[o + TO - 1] : 0) + (o < TO ? pOff[o + TO + 1] : 0)) / 4;
+    // 炮塔每转 0.1 弧度要 10ms，这段时间里对手又挪了位置：转得远的方向要打折，免得在两侧切线之间来回甩。
+    let sc = v - (turEst === turEst ? 0.3 * Math.max(0, Math.abs(wrap(thOff[o + TO] - turEst)) - 0.05) : 0);
+    if (Math.abs(o - lastOff) < 2.5) sc += 0.015;
+    if (sc > best) { best = sc; bo = o; bp = v; }
+  }
+  lastOff = bo; best = bp;
+  // 瞄点放在弹道离对手最近的那一点：我方位置估计有偏差时，弹道仍然经过这一点。
+  const th = base + Math.asin(clamp(bo / D, -0.95, 0.95)), c = Math.cos(th), s = Math.sin(th);
+  const L = Math.max(30, (mxT - mx) * c + (myT - my) * s);
+  return { qx: mx + c * L, qy: my + s * L, p: Math.min(1, best), d: bo, tof, D };
+}
+
 function bestAim(k, mx, my, tFire) {
   const dx = k.x - mx, dy = k.y - my, D = Math.hypot(dx, dy) || 1, ux = dx / D, uy = dy / D, nx = -uy, ny = ux;
   const tof = Math.max(0, D - MUZ) / BV, T = Math.max(0.02, (tFire - k.t) / 1000 + tof);
@@ -644,6 +715,7 @@ function bestAim(k, mx, my, tFire) {
   while (b < TB.length - 1 && Math.abs(TB[b + 1] - T) < Math.abs(TB[b] - T)) b++;
   const S = samp[b], N = Math.min(S.n, NS), sc = T / TB[b];
   const sp = Math.hypot(k.vx, k.vy), mv = sp > 25 ? 1 : 0, ex = mv ? k.vx / sp : 1, ey = mv ? k.vy / sp : 0;
+  if (D < NEAR_D) return aimNear(k, mx, my, D, ux, uy, (tFire - k.t) / 1000, S, N, sc, T, mv, ex, ey);
   hist.fill(0);
   let ws = 0;
   for (let j = 0; j < N; j++) {
@@ -698,19 +770,24 @@ function aimPoint(mx, my, qx, qy) {
 }
 
 // ───────────────────────── 战果统计与交战距离 ─────────────────────────
-// 按开火距离分三段（<150 / 150–230 / 更远）统计我方实际命中率，据此决定在哪开火、站多远。
-// 远距离打得中的对手就站远了打；打不中（对手会用装甲相位化解）就蓄满余量、突入近距离连发后撤出。
-const BK = D => D < 150 ? 0 : D < 230 ? 1 : 2;
-const tally = { shots: [0, 0, 0], hits: [0, 0, 0], pSum: [0, 0, 0], took: [0, 0, 0] };
-const PRIOR = [[0.5, 4], [0.2, 4], [0.3, 6]];
-const rate = b => (tally.hits[b] + PRIOR[b][0] * PRIOR[b][1]) / (tally.shots[b] + PRIOR[b][1]);
-const flying = [];
-let hpMe0 = 1, hpFoe0 = 1, dmgUnit = 0, curD = 540, dPref = 300, raid = 0, raidT = 0, raidIn = false, raidFail = 0;
+// 交战距离只有一个：顶住对手。
+// 炮口离车心 42px，两车顶住时对手的炮口已经伸到我方朝向它的装甲板内侧，照常瞄准的弹出膛就被车体挡下；
+// 我方打车体边缘外侧的切线（见 aimNear），那里不论装甲转到哪个相位都有板。
+// 早先的版本会先站远试射、按战况在远和贴身之间切换。拿四十多个风格各异的假想敌比下来，
+// 开局直接顶上去、不离开，反而是最稳的：凡是不在贴身的时间，都是在让瞄得准的对手白打。
+const HUG = 53;
+// 按开火距离分四段统计（只用于调试输出）。
+const BK = D => D < 66 ? 0 : D < 150 ? 1 : D < 230 ? 2 : 3;
+const tally = { shots: [0, 0, 0, 0], hits: [0, 0, 0, 0], pSum: [0, 0, 0, 0], took: [0, 0, 0, 0] };
+const flying = [], pRing = new Float32Array(32), pSort = new Float32Array(32);
+let pRN = 0, overN = 0;
+// 单发伤害占满血的比例：按默认房间（20 发致命）起步，第一次有人掉血时改成实测值。
+let hpMe0 = 1, hpFoe0 = 1, dmgUnit = 0.05, dmgSeen = false, curD = 540, dPref = 300, nearT = 0;
 // 把对手掉血记到「预计此刻到达」的那发弹丸所属的距离段；我方掉血记到当时的距离段。
 function credit() {
   const t = est.t, drop = hpFoe0 - est.hp.foe;
   if (drop > 0.004) {
-    if (!dmgUnit || drop < dmgUnit * 0.9) dmgUnit = drop;
+    if (!dmgSeen || drop < dmgUnit * 0.9) { dmgUnit = drop; dmgSeen = true; }
     for (let n = Math.max(1, Math.round(drop / dmgUnit)); n > 0 && flying.length; n--) {
       let bi = 0, bd = 1e9;
       for (let i = 0; i < flying.length; i++) { const e = Math.abs(flying[i].ta - t); if (e < bd) { bd = e; bi = i; } }
@@ -721,24 +798,13 @@ function credit() {
   hpFoe0 = est.hp.foe;
   for (let i = flying.length - 1; i >= 0; i--) if (flying[i].ta < t - 160) flying.splice(i, 1);
   const lost = hpMe0 - est.hp.me;
-  if (lost > 0.004) tally.took[BK(curD)] += Math.max(1, Math.round(lost / (dmgUnit || lost)));
+  if (lost > 0.004) {
+    // 单发伤害也可以从自己掉的血里学到。
+    if (!dmgSeen || lost < dmgUnit * 0.9) { dmgUnit = lost; dmgSeen = true; }
+    tally.took[BK(curD)] += Math.max(1, Math.round(lost / dmgUnit));
+  }
   hpMe0 = est.hp.me;
 }
-function stance(t, heat) {
-  if (rate(2) >= 0.14) { raid = 0; return 300; }
-  if (!raid) {
-    // 近战实测吃亏且并未落后时不再突入；突入没追上则拉长下次尝试的间隔，除非对手自己靠近。
-    const sour = tally.took[0] > tally.hits[0] + 2 && est.hp.me >= est.hp.foe - 0.02;
-    const reach = raidFail < 2 || curD < 210 || t - raidT > 4000 * raidFail;
-    // 突入时机：自己有整串连发的余量，且对手热量高（没有连发余量）或已等了很久。
-    if (heat <= 24 && !sour && reach && (est.foeHeat >= 55 || t - raidT > 6000)) { raid = 1; raidT = t; raidIn = false; dbg.raids++; }
-    return 300;
-  }
-  if (curD < 150) raidIn = true;
-  if (heat >= 78 || t - raidT > 4500) { raidFail = raidIn ? 0 : Math.min(3, raidFail + 1); raid = 0; raidT = t; return 300; }
-  return 105;
-}
-
 // ───────────────────────── 机动与防御 ─────────────────────────
 const NDIR = 24, AIMJIT = [[0, 0.5], [0.04, 0.25], [-0.04, 0.25]];
 const PERT = [[0, 0, 0.4], [3.5, 0, 0.2], [-3.5, 0, 0.2], [0, 0.1, 0.1], [0, -0.1, 0.1]];
@@ -751,7 +817,7 @@ function evalMove(ux, uy, spin, me, k, th) {
   if (x1 > FW - AR - g) c += 4 * ((x1 - (FW - AR - g)) / g) ** 2;
   if (y1 < AR + g) c += 4 * ((AR + g - y1) / g) ** 2;
   if (y1 > FH - AR - g) c += 4 * ((y1 - (FH - AR - g)) / g) ** 2;
-  const D = Math.hypot(k.x + k.vx * 0.2 - x1, k.y + k.vy * 0.2 - y1); c += 0.7 * ((D - dPref) / 100) ** 2;
+  const D = Math.hypot(k.x + k.vx * 0.2 - x1, k.y + k.vy * 0.2 - y1); c += dPref < 80 ? 0.08 * Math.abs(Math.max(52, D) - dPref) : 0.7 * ((D - dPref) / 100) ** 2;
   let risk = 0;
   // 贴墙时被截断的速度分量按 0 处理。
   const evx = (x1 - me.x) * 4, evy = (y1 - me.y) * 4;
@@ -763,8 +829,10 @@ function evalMove(ux, uy, spin, me, k, th) {
 }
 function chooseMove(t, me, k) {
   if (t > wander.until) {
-    const base = Math.atan2(k.y - me.y, k.x - me.x), a = base + (rnd() < 0.5 ? 1 : -1) * (HALF + (rnd() - 0.5) * 1.5);
-    wander.c = Math.cos(a); wander.s = Math.sin(a); wander.until = t + 110 + rnd() * 260;
+    // 贴身时对手只能打车体两侧各约 5px 宽的切线窗口，横向挪几个像素就脱开：改成又快又不规则的左右横移。
+    const tight = dPref < 80 && curD < 75;
+    const base = Math.atan2(k.y - me.y, k.x - me.x), a = base + (rnd() < 0.5 ? 1 : -1) * (HALF + (rnd() - 0.5) * (tight ? 0.5 : 1.5));
+    wander.c = Math.cos(a); wander.s = Math.sin(a); wander.until = t + (tight ? 22 - 50 * Math.log(1 - rnd() * 0.95) : 110 + rnd() * 260);
   }
   // 把来弹推进到此刻，筛出有可能够到我的。
   const th = [];
@@ -797,27 +865,41 @@ function chooseMove(t, me, k) {
   return best;
 }
 
+// 我方位置外推。两车不能重叠：顶住对手后，宿主把重叠量对半分给双方，朝对手方向多走的那段只算一半。
+const adv = { x: 0, y: 0 };
+function advance(x, y, vx, vy, dt, k) {
+  x += vx * dt; y += vy * dt;
+  if (k) { const dx = k.x - x, dy = k.y - y, d = Math.hypot(dx, dy); if (d < 52 && d > 1e-6) { const c = (52 - d) / 2 / d; x -= dx * c; y -= dy * c; } }
+  adv.x = clamp(x, AR, FW - AR); adv.y = clamp(y, AR, FH - AR);
+  return adv;
+}
 function decide(t) {
   const lag = Math.min(0.25, Math.max(0, (t - est.t) / 1000));
-  const me = { x: clamp(est.me.x + cmd.vx * lag, AR, FW - AR), y: clamp(est.me.y + cmd.vy * lag, AR, FH - AR), a: est.me.a + cmd.om * lag };
-  const out = { act: { moveX: 0, moveY: 0, spin: 0, aimX: 0.5, aimY: 0.5, durationMs: 150 }, fire: false, dir: aimDir, m: cmd, shot: null };
   const k = est.k;
+  advance(est.me.x, est.me.y, cmd.vx, cmd.vy, lag, k);
+  const me = { x: adv.x, y: adv.y, a: est.me.a + cmd.om * lag };
+  const out = { act: { moveX: 0, moveY: 0, spin: 0, aimX: 0.5, aimY: 0.5, durationMs: 150 }, fire: false, dir: aimDir, m: cmd, shot: null };
   if (!k) return out;
   const heat = heatNow(t);
   curD = Math.hypot(k.x - me.x, k.y - me.y);
-  dPref = est.countdown ? 300 : stance(t, heat);
+  dPref = est.countdown ? 300 : HUG;
+  if (est.countdown || curD < 150) nearT = t;
   const mv = chooseMove(t, me, k);
   out.act.moveX = mv.x; out.act.moveY = mv.y; out.act.spin = mv.spin;
   out.m = motion(mv.x, mv.y, mv.spin);
   // 炮塔需要转过的角度越大，出膛越晚：按预计出膛时刻解算瞄点（先粗算一次估转角，再精算）。
-  let lead = LEAD, sol = null, fx = 0, fy = 0, err = 0;
+  // 指令要等下一个控制边界才生效。act 返回的时刻紧跟在边界之后，由它推出离下一个边界还有多久。
+  let toB = STEP - ((t - bndT + 2) % STEP);
+  if (toB < 1.5) toB += STEP;
+  const lead0 = bndT ? toB + LEAD : 17;
+  let lead = lead0, sol = null, fx = 0, fy = 0, err = 0;
   for (let pass = 0; pass < 2; pass++) {
-    fx = me.x + out.m.vx * lead / 1000; fy = me.y + out.m.vy * lead / 1000;
+    advance(me.x, me.y, out.m.vx, out.m.vy, lead / 1000, k); fx = adv.x; fy = adv.y;
     sol = bestAim(k, fx, fy, t + lead);
     out.dir = Math.atan2(sol.qy - fy, sol.qx - fx);
     err = Math.abs(wrap(turEst - out.dir));
     if (err < 0.03 || err > 0.3 || curD >= 150) break;
-    lead = 15 + err * 100;
+    lead = lead0 + err * 100;
   }
   const [ax, ay] = aimPoint(fx, fy, sol.qx, sol.qy);
   out.act.aimX = ax; out.act.aimY = ay;
@@ -826,15 +908,26 @@ function decide(t) {
   const ready = curD >= 150 ? err < 0.03 : err < 0.3;
   if (!est.countdown) {
     dbg.pSum += sol.p; dbg.pN++;
-    // 这一发的预期命中率：该距离段的实测命中率 × 本次把握相对平均把握的比例。
-    const b = BK(sol.D), n = tally.shots[b], q = rate(b) * clamp(sol.p / Math.max(0.05, n ? tally.pSum[b] / n : 0.5), 0.4, 1.6);
+    const b = BK(sol.D);
+    // 双方都还要挨很多发时，把贴近途中的热量省下来留到顶住再用；任一方只剩三发以内的血时先手更要紧，不省。
+    const save = dmgUnit > 0 && est.hp.me > dmgUnit * 3.2 && est.hp.foe > dmgUnit * 3.2;
     let want;
-    if (b === 0) want = sol.p >= 0.06;                              // 近距离内热量不是瓶颈：有把握就打
-    else if (raid) want = false;                                    // 突入途中留着余量
-    else if (rate(b) >= 0.14) want = q >= 0.12 && (heat < 60 || q >= 0.3);
-    else want = heat <= 8;                                          // 僵持距离：只用凉透后本会浪费的那点余量
-    out.fire = want && ready && t - lastFire >= fireGap && t - est.t < 140 && heat <= 87;
-    out.shot = { b, p: sol.p, tof: sol.tof };
+    if (b < 2) {
+      // 近距离：有余量时抓紧打；热量吃紧时一发要等半秒才凉回来，只在最近 32 次解算里把握排进前六的时刻打。
+      pRing[pRN++ & 31] = sol.p;
+      let thr = 0.3;
+      if (heat >= 50 && pRN >= 16) { pSort.set(pRing); pSort.sort(); thr = Math.max(0.38, pSort[26]); }
+      // 贴近途中 95px 以外不打：这一段的实测命中率只有顶住之后的一半不到，热量留到顶住再用。
+      want = sol.p >= thr && !(save && sol.D > 95);
+    }
+    // 150px 以外不开火：打不中，白白烧掉连发的余量。只有追了三秒还进不了 150px 的对手，才用凉透的那点余量打冷枪。
+    else want = t - nearT > 3000 && heat <= 8 && sol.p >= 0.2;
+    // 收尾：双方都残血、对手只剩一发的血时，允许顶着过热多打一发抢先结束（过热自损一成血，最多两次）。
+    // 自己血量还多的局不这么做：那种局不缺这半秒，白白自损。
+    const last = dmgUnit > 0 && est.hp.foe > 0 && est.hp.foe <= dmgUnit * 1.2 && est.hp.me <= 0.4 && est.hp.me > 0.12 + dmgUnit * 1.5 && overN < 2 && heat > 87 && heat <= 97;
+    out.fire = want && ready && t - lastFire >= fireGap && t - est.t < 140 && (heat <= 87 || last);
+    out.over = last;
+    out.shot = { b, p: sol.p, tof: sol.tof, d: sol.d };
   }
   return out;
 }
@@ -854,6 +947,8 @@ for (;;) {
     if (!(a.aimX >= 0 && a.aimX <= 1)) a.aimX = 0.5;
     if (!(a.aimY >= 0 && a.aimY <= 1)) a.aimY = 0.5;
     obs = await lab.act(a); arrive = now(); calls++;
+    const actAt = arrive;
+    bndT = arrive;
     cmd.vx = plan.m.vx; cmd.vy = plan.m.vy; cmd.om = plan.m.om;
     if (a.spin || !(a.moveX || a.moveY) || a.moveX !== lastMX || a.moveY !== lastMY) impureT = arrive;
     lastMX = a.moveX; lastMY = a.moveY;
@@ -870,17 +965,32 @@ for (;;) {
       const tf = now(), s = plan.shot;
       heatNow(tf); heatM += 10;
       shots.push(tf); if (shots.length > 40) shots.shift();
-      lastFire = tf; dbg.fires++; reqN++;
+      lastFire = tf; dbg.fires++; reqN++; if (plan.over) overN++;
       tally.shots[s.b]++; tally.pSum[s.b] += s.p; flying.push({ ta: tf + 10 + s.tof * 1000, b: s.b });
+      if (DEBUG) dbg.sh.push([Math.round(curD), s.d, +s.p.toFixed(2), Math.round(rest * 1000)]);
       obs = await lab.fire(); arrive = now(); calls++;
     }
     fails = 0; dbg.loops++;
     // 宿主对单局调用次数有上限：接近时放慢节奏。
     if (calls > 26000) await lab.sleep(30);
+    else if (POLL && !est.countdown && obs.frameId === est.frame) {
+      // 画面每两个控制周期采样一次，编码要几毫秒：在采样边界返回的 act 带回的还是旧画面。
+      // 新画面编码完成时离下一个控制边界还有一小段时间，这时主动取一次，决策就能赶上下一个边界生效，
+      // 不必再等一个周期。只在新画面按节奏应当出现的时刻去取，避免空等。
+      const dead = actAt + 11;
+      let tw = Math.max(est.t + SLOT + ENC - 0.5, now() + 0.3);
+      for (let i = 0; i < 4 && tw <= dead && tw < est.t + SLOT + ENC + 25; i++) {
+        while (now() < tw);
+        const o = await lab.observe(); calls++; dbg.poll++;
+        if (o.frameId !== est.frame) { obs = o; arrive = now(); dbg.fresh++; break; }
+        tw = now() + 2;
+      }
+    }
     if (DEBUG && arrive - logAt > 2000) {
       logAt = arrive; calls++;
-      await lab.log(JSON.stringify({ f: dbg.frames, lp: dbg.loops, fire: dbg.fires, raid, raids: dbg.raids, rf: raidFail, v: Math.round(vMax), gap: Math.round(fireGap), spin: dbg.spin, risk: +dbg.risk.toFixed(1), dec: +(dbg.decode / Math.max(1, dbg.frames)).toFixed(1), p: +(dbg.pSum / Math.max(1, dbg.pN)).toFixed(2), heat: Math.round(est.heat), fh: Math.round(est.foeHeat), hp: [est.hp.me.toFixed(2), est.hp.foe.toFixed(2)], D: Math.round(curD), sh: tally.shots, hi: tally.hits, tk: tally.took, err: dbg.err }));
-      dbg.frames = dbg.fires = dbg.loops = dbg.lost = dbg.spin = dbg.risk = dbg.decode = dbg.pSum = dbg.pN = 0;
+      await lab.log(JSON.stringify({ f: dbg.frames, lp: dbg.loops, fire: dbg.fires, poll: [dbg.fresh, dbg.poll], v: Math.round(vMax), gap: Math.round(fireGap), spin: dbg.spin, risk: +dbg.risk.toFixed(1), dec: +(dbg.decode / Math.max(1, dbg.frames)).toFixed(1), p: +(dbg.pSum / Math.max(1, dbg.pN)).toFixed(2), heat: Math.round(est.heat), fh: Math.round(est.foeHeat), hp: [est.hp.me.toFixed(2), est.hp.foe.toFixed(2)], D: Math.round(curD), sh: tally.shots, hi: tally.hits, tk: tally.took, err: dbg.err, S: dbg.sh }));
+      dbg.sh = [];
+      dbg.frames = dbg.fires = dbg.loops = dbg.lost = dbg.spin = dbg.risk = dbg.decode = dbg.pSum = dbg.pN = dbg.poll = dbg.fresh = 0;
     }
   } catch (e) {
     if (++fails > 40) return;
